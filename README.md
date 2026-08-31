@@ -526,7 +526,6 @@
       transition: width 0.45s cubic-bezier(0.16, 1, 0.3, 1);
     }
 
-    /* In grid mode, the project section expands across the board while the topbar stays strictly pinned left */
     .board-layout.tiles-only-mode .projects-column-section {
       width: 100%;
       min-width: 100%;
@@ -550,7 +549,6 @@
       padding: 0;
     }
 
-    /* Project topbar: fixed left width with no layout jumping */
     .project-section-topbar {
       display: flex;
       align-items: center;
@@ -2428,6 +2426,35 @@
     </aside>
   </div>
 
+  <!-- MODAL: PASTE A PLAN -->
+  <div class="modal-backdrop" id="modal-paste-plan">
+    <div class="task-modal-card" style="max-width: 480px; padding: 1.75rem 2rem;">
+      <div style="display:flex; flex-direction:column; gap:0.35rem;">
+        <span class="modal-project-tag" style="letter-spacing:0.18em; font-size:0.68rem; color:var(--text-subtle);">PASTE A PLAN</span>
+        <h2 style="font-family:'Fraunces', Georgia, serif; font-size:1.55rem; font-weight:700; color:var(--text); margin-top:0.15rem;">Add a copied plan</h2>
+        <p style="font-size:0.8rem; color:var(--text-muted); line-height:1.45; margin-top:0.25rem;">
+          Paste a plan you copied from an archived week or another planner. It’s added below your current projects.
+        </p>
+      </div>
+
+      <textarea 
+        class="assistant-input-area" 
+        id="paste-plan-input" 
+        placeholder="Paste here with Cmd/Ctrl+V..." 
+        style="min-height: 120px; font-family:'JetBrains Mono', monospace; font-size:0.8rem; line-height:1.4; margin-top:0.5rem;"></textarea>
+
+      <label style="display:flex; align-items:center; gap:0.55rem; cursor:pointer; user-select:none; font-size:0.82rem; color:var(--text); margin-top:0.25rem;">
+        <input type="checkbox" id="paste-reset-checkmarks" class="custom-check-box" checked style="width:17px; height:17px;" />
+        <span>Reset checkmarks <span style="color:var(--text-muted); font-size:0.75rem;">(start fresh)</span></span>
+      </label>
+
+      <div class="modal-footer-row" style="margin-top:0.75rem;">
+        <button class="btn-modal-cancel" id="btn-cancel-paste-modal">Cancel</button>
+        <button class="btn-modal-save" id="btn-submit-paste-plan" style="background:#181a1f; color:#ffffff; padding:0.55rem 1.3rem; border-radius:8px;">Add to board</button>
+      </div>
+    </div>
+  </div>
+
   <!-- MODAL: FOCUS AUDIO, MUSIC & ALARM HUB -->
   <div class="modal-backdrop" id="modal-audio-alarm-hub">
     <div class="task-modal-card">
@@ -3307,21 +3334,124 @@
       });
     });
 
+    /* PASTE A PLAN MODAL & PARSER (planner.plan.v1 support) */
+    const pastePlanModal = document.getElementById('modal-paste-plan');
+    const pastePlanInput = document.getElementById('paste-plan-input');
+    const pasteResetCheckmarks = document.getElementById('paste-reset-checkmarks');
+
     document.getElementById('btn-paste-plan').addEventListener('click', () => {
-      navigator.clipboard.readText().then(text => {
-        try {
-          const parsed = JSON.parse(text);
-          if (Array.isArray(parsed)) {
-            const week = initCurrentWeekData();
-            week.projects = parsed;
-            sound.playComplete();
-            saveState();
-            showToast('Plan restored from clipboard!', '✅');
-          }
-        } catch (e) {
-          alert('Invalid plan JSON in clipboard');
+      pastePlanInput.value = '';
+      pastePlanModal.classList.add('active');
+      sound.playTick();
+      setTimeout(() => {
+        pastePlanInput.focus();
+        if (navigator.clipboard && navigator.clipboard.readText) {
+          navigator.clipboard.readText().then(text => {
+            if (text && (text.trim().startsWith('{') || text.trim().startsWith('['))) {
+              pastePlanInput.value = text;
+            }
+          }).catch(() => {});
         }
-      });
+      }, 100);
+    });
+
+    document.getElementById('btn-cancel-paste-modal').addEventListener('click', () => {
+      pastePlanModal.classList.remove('active');
+    });
+
+    function formatDeadlineString(isoStr) {
+      if (!isoStr) return 'No due date';
+      try {
+        const d = new Date(isoStr);
+        if (isNaN(d.getTime())) return isoStr;
+        const m = d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+        let hours = d.getHours();
+        const minutes = d.getMinutes().toString().padStart(2, '0');
+        const ampm = hours >= 12 ? 'PM' : 'AM';
+        hours = hours % 12 || 12;
+        return `${m} ${hours}:${minutes} ${ampm}`;
+      } catch (e) {
+        return isoStr;
+      }
+    }
+
+    document.getElementById('btn-submit-paste-plan').addEventListener('click', () => {
+      const rawText = pastePlanInput.value.trim();
+      if (!rawText) return;
+
+      const resetDone = pasteResetCheckmarks.checked;
+      const currentWeek = initCurrentWeekData();
+
+      try {
+        const parsed = JSON.parse(rawText);
+
+        // Format A: planner.plan.v1 specification
+        if (parsed.marker === 'planner.plan.v1' || (parsed.tasks && Array.isArray(parsed.tasks) && parsed.tasks.some(t => t.subs))) {
+          (parsed.tasks || []).forEach((projItem, pIdx) => {
+            const projectName = projItem.title || projItem.name || `Imported Project ${pIdx + 1}`;
+            const newProject = {
+              id: 'p_' + (projItem.id || Date.now() + '_' + pIdx),
+              name: projectName,
+              subtitle: 'Imported Plan',
+              tasks: []
+            };
+
+            const subList = Array.isArray(projItem.subs) ? projItem.subs : (projItem.tasks || []);
+            
+            subList.forEach((sub, sIdx) => {
+              const isoDate = sub.deadline ? sub.deadline.split('T')[0] : '';
+              const daysAssigned = Array.isArray(sub.slots) && sub.slots.length > 0 
+                ? sub.slots.map(s => s.day || s) 
+                : [];
+
+              newProject.tasks.push({
+                id: 't_' + (sub.id || Date.now() + '_' + sIdx),
+                text: sub.title || sub.text || 'Untitled Task',
+                completed: resetDone ? false : !!sub.done,
+                priority: sub.priority || 'med',
+                isoDate: isoDate,
+                due: formatDeadlineString(sub.deadline || sub.due),
+                est: sub.est || '45m',
+                days: daysAssigned,
+                note: sub.desc || sub.note || '',
+                subtasks: []
+              });
+            });
+
+            currentWeek.projects.push(newProject);
+          });
+
+          sound.playComplete();
+          launchCelebration();
+          saveState();
+          pastePlanModal.classList.remove('active');
+          showToast('Plan added to board successfully!', '📋');
+          return;
+        }
+
+        // Format B: Direct Project Array (native export format)
+        if (Array.isArray(parsed)) {
+          parsed.forEach(proj => {
+            if (resetDone && Array.isArray(proj.tasks)) {
+              proj.tasks.forEach(t => {
+                t.completed = false;
+                if (t.subtasks) t.subtasks.forEach(st => st.completed = false);
+              });
+            }
+            currentWeek.projects.push(proj);
+          });
+
+          sound.playComplete();
+          saveState();
+          pastePlanModal.classList.remove('active');
+          showToast('Plan restored from clipboard!', '✅');
+          return;
+        }
+
+        alert('Unrecognized plan JSON format.');
+      } catch (err) {
+        alert('Invalid JSON: Please ensure you copied the complete plan object.');
+      }
     });
 
     /* AI NATURAL LANGUAGE PARSER */
@@ -3816,6 +3946,7 @@
         document.getElementById('modal-new-project').classList.remove('active');
         document.getElementById('modal-shortcuts').classList.remove('active');
         document.getElementById('modal-backup').classList.remove('active');
+        pastePlanModal.classList.remove('active');
       }
     });
 
@@ -3833,6 +3964,7 @@
         { label: '📝 Open Scratchpad Notes', action: () => document.getElementById('btn-toggle-scratchpad').click(), tag: 'Notes' },
         { label: '🎧 Audio & Alarm Panel', action: () => document.getElementById('btn-open-audio-modal').click(), tag: 'Audio' },
         { label: '💾 Backup & Export Suite', action: () => document.getElementById('btn-open-backup-modal').click(), tag: 'Data' },
+        { label: '📋 Paste a Copied Plan', action: () => document.getElementById('btn-paste-plan').click(), tag: 'Import' },
         { label: 'Export Markdown Digest', action: () => document.getElementById('btn-export-markdown').click(), tag: 'Export' },
         { label: 'Toggle Grid / Split Timeline View', action: () => { appState.isTilesView = !appState.isTilesView; render(); }, tag: 'Layout' },
         { label: 'Switch to Board View', action: () => switchView('board'), tag: 'View' },
